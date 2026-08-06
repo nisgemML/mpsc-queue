@@ -38,6 +38,7 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include <algorithm>
 #include <x86intrin.h>
 
 using namespace mpsc;
