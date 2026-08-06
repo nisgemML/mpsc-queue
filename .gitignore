@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.out
+bench_batch
+bench_mpsc
+bench_t2t
+test_correctness
+test_tsan
+test_batch
