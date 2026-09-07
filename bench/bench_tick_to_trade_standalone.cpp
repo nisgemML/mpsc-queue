@@ -195,7 +195,6 @@ int main() {
 
     // Timed region
     for (size_t i = WARMUP; i < N + WARMUP; ++i) {
-        const WireEvent& ev = g_events[i];
         const uint64_t t0 = rdtscp_ns();
 
         // Decode (cast from wire bytes)

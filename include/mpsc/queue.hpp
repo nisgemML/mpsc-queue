@@ -32,7 +32,10 @@
 // The "incomplete push" window: after swap(tail_, new_node) but before
 // setting prev->next = new_node, head_->next may be null even though the
 // queue is non-empty.  The consumer handles this by returning nullptr and
-// retrying.
+// retrying — see the recommended retry pattern in pop()'s doc comment
+// below. Node lifetime after a successful pop() has its own subtlety
+// (a popped node is still part of the queue's internal bookkeeping until
+// the *following* pop() call) — also documented on pop() below.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // MEMORY ORDERING PROOF
@@ -251,7 +254,8 @@ public:
     // Called from exactly ONE thread (the consumer).
     //
     // Returns nullptr if the queue is empty or transiently in the
-    // "incomplete push" window.  The caller should retry on nullptr.
+    // "incomplete push" window (see the file header). The caller must
+    // retry on nullptr — this is not an error condition.
     //
     // head_ is the sentinel pointing *before* the first real node.
     // We advance head_ past the consumed node, leaving the consumed node
@@ -268,8 +272,51 @@ public:
     //
     // (4) return static_cast<T*>(next)
     //
+    // ── Node lifetime after pop() — the constraint that actually bites ───────
+    //
+    // The node returned by pop() does not simply become "owned by the
+    // caller" the way a value popped off std::queue would. Internally it
+    // becomes the new sentinel: head_ now points at it, and the *next*
+    // call to pop() will read THIS node's `next` field to find whatever
+    // comes after it. Concretely: after `T* a = q.pop();` succeeds, `a` is
+    // still part of the queue's internal bookkeeping until the following
+    // pop() call completes (whether that call returns another node or
+    // nullptr).
+    //
+    // Practical consequence: do not recycle, mutate, or re-push a popped
+    // node until you have called pop() again at least once more. A pool
+    // that hands a just-popped node straight back to a producer — which
+    // will overwrite that node's `next` field as step 1 of push() — races
+    // with the queue's own traversal of that same field and can corrupt
+    // the list (this is not hypothetical: an earlier draft of this repo's
+    // own stress benchmark hit exactly this bug — see bench/bench_stress.cpp
+    // for the fix, which defers freeing a node by one pop). If you need a
+    // fixed-size node pool fed back to producers, free a node only once
+    // you're holding the NEXT one, not the one just returned.
+    //
     // Note: the old head_ (stub or previous consumed node) is NOT freed here.
-    // The caller is responsible for managing the lifetime of popped nodes.
+    // The caller is responsible for managing the lifetime of popped nodes,
+    // subject to the one-pop-delay constraint above.
+    //
+    // ── Recommended retry pattern ─────────────────────────────────────────────
+    //
+    // A bare `while (!(p = q.pop())) ;` is correct but burns a full core
+    // even when the queue is genuinely idle, and on an oversubscribed or
+    // shared host (more runnable threads than cores) a pure spin can even
+    // starve the producer that would otherwise complete the pending push.
+    // Escalate instead — spin briefly (the incomplete-push window is a few
+    // instructions wide, so this is the common case), then yield, then
+    // sleep if the wait continues:
+    //
+    //   T* p; int spins = 0;
+    //   while ((p = q.pop()) == nullptr) {
+    //       if (spins < 1000)      { __builtin_ia32_pause(); ++spins; }
+    //       else if (spins < 1100) { std::this_thread::yield(); ++spins; }
+    //       else                    std::this_thread::sleep_for(20us);
+    //   }
+    //
+    // This is exactly the bench::Backoff helper in bench/histogram.hpp,
+    // used throughout this repo's own benchmarks for the same reason.
 
     [[nodiscard]] T* pop() noexcept {
         MpscNode* head = head_.load(std::memory_order_relaxed);   // consumer-only

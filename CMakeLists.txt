@@ -44,22 +44,52 @@ add_executable(test_tsan tests/test_tsan.cpp)
 target_link_libraries(test_tsan PRIVATE mpsc_iface)
 add_test(NAME TSanLitmus COMMAND test_tsan)
 
-# ── Benchmark ─────────────────────────────────────────────────────────────────
-
-add_executable(bench_mpsc bench/bench_mpsc.cpp)
-target_link_libraries(bench_mpsc PRIVATE mpsc_iface)
-# Not added to ctest — run manually.
-
-add_executable(bench_batch bench/bench_batch.cpp)
-target_link_libraries(bench_batch PRIVATE mpsc_iface)
-# Not in ctest — run manually: ./bench_batch
-
 add_executable(test_batch tests/test_batch.cpp)
 target_link_libraries(test_batch PRIVATE mpsc_iface)
 add_test(NAME BatchCorrectness COMMAND test_batch)
 
-# bench_tick_to_trade_standalone: no external deps, measures
-# ITCH decode → LOB update → A-S quote decision latency.
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+# None of these are registered with ctest — they're manual, and several
+# take multiple seconds to minutes by design (sustained-load measurement).
+# See BENCHMARK_RESULTS.md for what each one measures and how to reproduce
+# results on dedicated hardware.
+
+add_executable(bench_mpsc bench/bench_mpsc.cpp)
+target_link_libraries(bench_mpsc PRIVATE mpsc_iface)
+
+add_executable(bench_batch bench/bench_batch.cpp)
+target_link_libraries(bench_batch PRIVATE mpsc_iface)
+
+add_executable(bench_stress bench/bench_stress.cpp)
+target_link_libraries(bench_stress PRIVATE mpsc_iface)
+# Sustained multi-producer contention + latency histograms.
+# Run: ./bench_stress [duration_seconds]
+
+# bench_t2t_standalone: no external deps, measures
+# ITCH decode → LOB update → A-S quote decision latency, single thread.
 add_executable(bench_t2t bench/bench_tick_to_trade_standalone.cpp)
 target_link_libraries(bench_t2t PRIVATE mpsc_iface)
-# Not in ctest — run manually: taskset -c 4 chrt -f 80 ./bench_t2t
+
+add_executable(bench_t2t_queue bench/bench_tick_to_trade_queue.cpp)
+target_link_libraries(bench_t2t_queue PRIVATE mpsc_iface)
+# Same decode/book/quote logic as bench_t2t, split across a decode thread
+# and a strategy thread connected by MpscQueue — measures the queue's
+# actual contribution to an end-to-end pipeline latency number.
+# Run: ./bench_t2t_queue [num_events]
+
+# bench_comparison needs Boost headers (header-only boost::lockfree) for
+# one of its four backends. It's optional: the rest of the build/tests do
+# not depend on Boost, so this target is skipped with a warning if Boost
+# isn't found rather than failing the whole configure step.
+find_package(Boost QUIET)
+if(Boost_FOUND)
+    add_executable(bench_comparison bench/bench_comparison.cpp)
+    target_link_libraries(bench_comparison PRIVATE mpsc_iface Boost::boost)
+else()
+    message(WARNING
+        "Boost not found — skipping bench_comparison "
+        "(MpscQueue vs mutex/spinlock/boost::lockfree::queue). "
+        "Install libboost-dev (or any package providing boost/lockfree/queue.hpp) "
+        "and re-run cmake to enable it.")
+endif()
+

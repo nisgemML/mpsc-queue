@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/nisgemML/mpsc-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/nisgemML/mpsc-queue/actions/workflows/ci.yml)
 
-The Vyukov intrusive MPSC (Multi-Producer Single-Consumer) queue in C++20, with a formal memory-ordering proof, ThreadSanitizer litmus tests, and a benchmark comparing it against a mutex-based baseline.
+The Vyukov intrusive MPSC (Multi-Producer Single-Consumer) queue in C++20, with a formal memory-ordering proof, ThreadSanitizer litmus tests, and benchmarks covering peak throughput, sustained multi-producer contention with latency histograms, a real end-to-end tick-to-trade pipeline routed through the queue, and a head-to-head comparison against a mutex, a spinlock, and `boost::lockfree::queue`.
 
 The proof is in [`proof/memory_model.md`](proof/memory_model.md). The short version: `memory_order_acquire`/`release` is sufficient. `seq_cst` would add a gratuitous `MFENCE` instruction on x86 for zero correctness benefit.
 
@@ -109,27 +109,52 @@ cmake --build build
 ./build/bench_mpsc
 ```
 
-Typical results (Linux x86-64, Ryzen 5900X, isolated core):
+Full results, methodology, and an explicit tier system for how much to
+trust a given number (shared container vs. pinned vs. kernel-isolated
+cores) are in [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md). Summary of
+what's there and how to reproduce it:
+
+| Benchmark | What it measures | Status |
+|---|---|---|
+| `bench_mpsc` | MPSC vs mutex throughput, ping-pong latency | Committed (container, pinned) |
+| `bench_batch` | Batch push vs single push, K=1..128 | Committed (container, pinned) |
+| `bench_t2t` | ITCH decode -> LOB -> A-S quote, single-threaded | Committed (container, pinned) |
+| `bench_stress` | Sustained (not peak) multi-producer contention, full latency histograms | Real numbers from a 1-vCPU sandbox (oversubscription behavior, not peak throughput); dedicated-core run still pending |
+| `bench_t2t_queue` | Same tick-to-trade pipeline, but split across a decode thread and a strategy thread connected by `MpscQueue` — the version that actually exercises the queue | Real numbers from a 1-vCPU sandbox; dedicated-core run still pending |
+| `bench_comparison` | `MpscQueue` vs `std::mutex`, a spinlock, and `boost::lockfree::queue`, same workload, with a written trade-off discussion | Real numbers from a 1-vCPU sandbox — `MpscQueue` ranks first at every producer count across two independent runs; dedicated-core run still pending |
+
+`scripts/run_pinned_bench.sh` runs all of the above with core isolation
+checks, `taskset`/`chrt -f` pinning, and governor/Turbo reporting, and
+tells you plainly if the environment it's running in doesn't qualify as a
+trustworthy result rather than silently printing numbers anyway. See
+`BENCHMARK_RESULTS.md` for exactly which numbers below are real
+measurements versus which are still pending a run on qualifying hardware —
+that document does not present anything as a result that wasn't actually
+produced by the command printed next to it.
+
+Numbers below are the committed container results (see
+`BENCHMARK_RESULTS.md` for the exact environment and full methodology):
 
 ```
-=== Throughput: MPSC vs Mutex ===
+=== Throughput: MPSC vs Mutex (msgs/sec) ===
 
-  MPSC   1 producers  1000000 msgs    38.2 ms    26.18 M msg/s
-  Mutex  1 producers  1000000 msgs    51.6 ms    19.38 M msg/s
+producers   K=1 (single push)
+1             46.73 M
+2             67.03 M
+4             75.76 M
+8             74.87 M
 
-  MPSC   4 producers  4000000 msgs   142.1 ms    28.15 M msg/s
-  Mutex  4 producers  4000000 msgs   438.7 ms     9.12 M msg/s
-
-  MPSC   8 producers  8000000 msgs   281.4 ms    28.43 M msg/s
-  Mutex  8 producers  8000000 msgs  1247.3 ms     6.41 M msg/s
-
-=== Push-to-pop latency (single producer) ===
-  p50     :  42 ns
-  p99     : 118 ns
-  p99.9   : 312 ns
+=== Push-to-pop latency (single-thread ping-pong) ===
+  p50     :  21 ns
+  p99     :  25 ns
+  p99.9   :  98 ns
 ```
 
-The lock-free advantage scales with producer count. At 8 producers, MPSC is ~4.4× faster than a mutex queue because producers only serialise on `LOCK XCHG` (~4 cycles) rather than on a kernel mutex (~20–40ns).
+These are same-thread round-trip numbers, not cross-thread contention under
+sustained load — see `BENCHMARK_RESULTS.md`'s "Sustained multi-producer
+contention" section for the harness built to measure that, and its
+"Comparison" section for `MpscQueue` benchmarked head-to-head against a
+mutex, a spinlock, and `boost::lockfree::queue` on the same workload.
 
 ---
 
@@ -174,7 +199,22 @@ cmake --build build_asan && ctest --test-dir build_asan --output-on-failure
 
 **Intrusive nodes.** Nodes must inherit `MpscNode`. For a non-intrusive version, embed a `MpscNode` as a member of a wrapper and use a free-list allocator to amortise allocation cost.
 
-**Incomplete push window.** `pop()` may return `nullptr` when a producer has completed `tail_.exchange` but not yet stored to `prev->next`. Callers must retry on `nullptr`. This is inherent to the algorithm and cannot be eliminated without adding a separate counter (at the cost of two extra atomics per operation).
+**Incomplete push window.** `pop()` may return `nullptr` when a producer has completed `tail_.exchange` but not yet stored to `prev->next`. Callers must retry on `nullptr`. This is inherent to the algorithm and cannot be eliminated without adding a separate counter (at the cost of two extra atomics per operation). Don't busy-spin unconditionally on this — see the recommended retry pattern below.
+
+**Node lifetime after `pop()`.** A node returned by `pop()` becomes the queue's new internal sentinel (`head_`) and stays part of the queue's bookkeeping until the *following* `pop()` call. Recycling that node back into circulation (e.g. handing it to a producer to re-push) before calling `pop()` again races the producer's reset of `node->next` against the consumer's next traversal and can corrupt the list. This bit `bench/bench_stress.cpp` during development — see `BENCHMARK_RESULTS.md`'s "Validation" section for how it manifested (a livelock, not a crash) and the fix (defer freeing a node by one `pop()`). Full detail and the fix pattern are in `queue.hpp`'s `pop()` doc comment.
+
+**Recommended retry pattern.** A bare `while (!(p = q.pop()));` is correct but burns a full core even when idle, and can starve producers on an oversubscribed host. Escalate: spin briefly, then yield, then sleep:
+
+```cpp
+T* p; int spins = 0;
+while ((p = q.pop()) == nullptr) {
+    if      (spins < 1000) { __builtin_ia32_pause(); ++spins; }
+    else if (spins < 1100) { std::this_thread::yield(); ++spins; }
+    else                     std::this_thread::sleep_for(20us);
+}
+```
+
+This is `bench::Backoff` in `bench/histogram.hpp`, used throughout this repo's own benchmarks.
 
 ---
 
