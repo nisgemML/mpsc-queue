@@ -6,7 +6,7 @@
 **Title option 2:**
 `Show HN: I proved Vyukov's MPSC queue correct under C++20 and added a batch-publish API`
 
-**URL:** (text post — no URL field)
+**URL:** https://news.ycombinator.com/item?id=49447000
 
 ---
 
