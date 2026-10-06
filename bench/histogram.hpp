@@ -23,7 +23,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <thread>
-#include <x86intrin.h>
+#include "mpsc/cpu_relax.hpp"
+#include <x86intrin.h>   // __rdtsc / __rdtscp: this header is x86-only (see CMakeLists.txt)
 
 namespace bench {
 
@@ -147,7 +148,7 @@ struct Backoff {
 
     void wait() noexcept {
         if (spins < 1000) {
-            __builtin_ia32_pause();
+            mpsc::cpu_relax();
         } else if (spins < 1100) {
             std::this_thread::yield();
         } else {

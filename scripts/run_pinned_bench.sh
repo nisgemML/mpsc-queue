@@ -142,6 +142,9 @@ run_pinned() {
 run_pinned bench_mpsc        "MPSC vs mutex throughput + ping-pong latency"
 run_pinned bench_batch       "Batch push vs single push"
 run_pinned bench_stress      "Sustained multi-producer contention"        3
+run_pinned bench_ordering    "acq_rel vs seq_cst push cost, uncontended"   single 9
+run_pinned bench_ordering    "acq_rel vs seq_cst, 2 producers + consumer" mp 2 5
+run_pinned bench_ordering    "acq_rel vs seq_cst, 4 producers + consumer" mp 4 5
 run_pinned bench_t2t         "Tick-to-trade, single-threaded (no queue)"
 run_pinned bench_t2t_queue   "Tick-to-trade THROUGH the queue"           500000
 if [[ -x "$BUILD_DIR/bench_comparison" ]]; then

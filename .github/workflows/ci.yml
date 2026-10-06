@@ -43,3 +43,52 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
+
+  # x86-64 is TSO: it reorders only a later load ahead of an earlier store,
+  # so most missing acquire/release bugs cannot show up there. AArch64 is
+  # weakly ordered — the orderings compile to different instructions
+  # (release store = STLR, acquire load = LDAR, relaxed = STR/LDR) and a
+  # missing one can cause real misbehaviour. Same suite, ARM runner.
+  build-test-arm64:
+    name: Build + Test arm64 (${{ matrix.build_type }}, ${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04-arm
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - build_type: Release
+            sanitizer: none
+          - build_type: RelWithDebInfo
+            sanitizer: tsan
+          - build_type: RelWithDebInfo
+            sanitizer: asan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake ninja-build g++ libboost-dev
+
+      - name: Record CPU and atomics codegen
+        run: |
+          lscpu | grep -E 'Model name|Architecture|Flags' || true
+          # LSE present -> push's exchange is a single SWPAL (wait-free);
+          # without it, an LDAXR/STLXR retry loop (lock-free only).
+          grep -qw atomics /proc/cpuinfo && echo "LSE atomics: yes" || echo "LSE atomics: no"
+
+      - name: Configure
+        run: |
+          EXTRA=""
+          [ "${{ matrix.sanitizer }}" = "tsan" ] && EXTRA="-DTSAN=ON"
+          [ "${{ matrix.sanitizer }}" = "asan" ] && EXTRA="-DASAN=ON"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} $EXTRA
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 300

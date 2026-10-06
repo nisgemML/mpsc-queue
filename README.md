@@ -1,10 +1,15 @@
-# Lock-Free MPSC Queue
+# Vyukov MPSC Queue (C++20)
 
 [![CI](https://github.com/nisgemML/mpsc-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/nisgemML/mpsc-queue/actions/workflows/ci.yml)
 
 The Vyukov intrusive MPSC (Multi-Producer Single-Consumer) queue in C++20, with a formal memory-ordering proof, ThreadSanitizer litmus tests, and benchmarks covering peak throughput, sustained multi-producer contention with latency histograms, a real end-to-end tick-to-trade pipeline routed through the queue, and a head-to-head comparison against a mutex, a spinlock, and `boost::lockfree::queue`.
 
-The proof is in [`proof/memory_model.md`](proof/memory_model.md). The short version: `memory_order_acquire`/`release` is sufficient. `seq_cst` would add a gratuitous `MFENCE` instruction on x86 for zero correctness benefit.
+**In 30 seconds**
+- **Proof:** seven claims ([`proof/memory_model.md`](proof/memory_model.md)), including *why* the exchange needs acquire: without it, a producer's link can be overwritten by the previous producer's `next = nullptr`, silently losing nodes.
+- **Measured, not asserted:** making every op `seq_cst` turns one locked `XCHG` per push into three. Push cost goes from 8.8 ns to 20.6 ns (2.3x), and pop is unchanged ([`bench/bench_ordering.cpp`](bench/bench_ordering.cpp)).
+- **Honest guarantees:** pushes are wait-free on x86 and ARM-LSE hardware. The queue as a whole is **not** lock-free and **not** linearizable, because a producer preempted mid-push hides later nodes. Most write-ups get this wrong, and so did this repo's first version.
+- **A contract bug, found and pinned:** the documented rule for reusing a popped node was wrong, and following it produced a self-looping node. [`tests/test_lifetime.cpp`](tests/test_lifetime.cpp) shows the failure and checks the correct rule under TSan and ASan.
+- **CI on x86-64 and AArch64:** a weakly ordered CPU can expose a missing acquire or release that x86 hides.
 
 ---
 
@@ -18,12 +23,13 @@ struct MyNode : MpscNode { int value; };
 
 MpscQueue<MyNode> q;
 
-// Any thread — wait-free:
+// Any thread — wait-free on x86 / ARM LSE:
 MyNode n{42};
 q.push(&n);
 
-// Consumer thread only — lock-free:
-MyNode* p = q.pop();   // returns nullptr if empty or incomplete push
+// Consumer thread only — never blocks, but nullptr means "nothing reachable
+// right now" (empty, or a producer mid-push), not "empty":
+MyNode* p = q.pop();
 ```
 
 Nodes must inherit `MpscNode`. The queue is intrusive (no internal allocation). Callers manage node lifetime.
@@ -72,13 +78,24 @@ user writes to p  →(seq-before)→  (P3) release-store
 ```
 By transitivity: user writes happen-before user reads. ∎
 
-**Claim 2 — `acq_rel` on `tail_.exchange` is sufficient:** it is not `seq_cst`. The acquire side ensures we see the previous tail-holder's writes; the release side ensures `node->next = nullptr` is visible to the next producer that reads `tail_`. No total order over all atomic operations is needed.
+**Claim 2 — `acq_rel` on `tail_.exchange` is necessary and sufficient:** the previous producer's release and our acquire make its `prev->next = nullptr` happen-before our `prev->next = node`. By write-write coherence our link then wins. Without that edge, the null could land last and drop our node. No total order over all atomics is needed, so `seq_cst` buys nothing. Its cost is measured below.
 
 **Claim 3 — No ABA:** the consumer uses no CAS — only an unconditional store to `head_`. Producers use only unconditional exchange on `tail_`. ABA requires a compare-and-swap that can match a re-used pointer; without CAS there is no ABA.
 
-**Claim 4 — Per-producer FIFO:** each producer's chain of `next` pointers is laid down sequentially. The consumer traverses the chain from `head_`, preserving each producer's push order.
+**Claim 4 — Per-producer FIFO:** list order equals the modification order of `tail_`, since every exchange returns its predecessor in that order. One producer's exchanges are sequenced, so coherence keeps them in program order. Other producers' nodes may land in between.
 
-**On x86-TSO:** release stores and acquire loads compile to plain `MOV`. The only cost relative to relaxed is the `LOCK XCHG` on `tail_.exchange` — required for atomicity regardless of ordering. Using `seq_cst` would add a `MFENCE` costing ~10–40ns per push, or ~100–400ms/sec at 10M msg/sec.
+**Claim 7 — Node lifetime:** a popped node may be reused only after a *later* `pop()` returns a different node. A `pop()` returning `nullptr` does not release it.
+
+**Progress, stated precisely:** push is wait-free where the hardware exchange is (x86 `LOCK XCHG`, ARM LSE `SWPAL`). The queue is **not lock-free and not linearizable**. If a producer is preempted between its exchange and its link store, every later node stays unreachable until that thread runs again, so a `pop()` can return `nullptr` after a later push has fully completed.
+
+**On x86-TSO:** release stores and acquire loads compile to plain `MOV`, and the `tail_` exchange is `LOCK XCHG` whatever ordering you request. GCC compiles a `seq_cst` store to `XCHG`, not `MFENCE`, so an all-`seq_cst` push has three locked instructions instead of one. Measured (single thread, uncontended, median of 9 runs, two invocations):
+
+| | push | pop |
+|---|---|---|
+| acq_rel | 8.7–8.8 ns | 1.9 ns |
+| all `seq_cst` | 20.5–20.9 ns | 1.9 ns |
+
+The 2- and 4-producer comparison needs dedicated cores. It is in `scripts/run_pinned_bench.sh`, and its results are not yet recorded.
 
 ---
 
@@ -116,6 +133,7 @@ what's there and how to reproduce it:
 
 | Benchmark | What it measures | Status |
 |---|---|---|
+| `bench_ordering` | Same algorithm with acq_rel vs all-`seq_cst` orderings: uncontended push/pop cost, and 2/4-producer throughput | Uncontended committed (container): +12 ns/push for seq_cst, pop unchanged. Contended: pending dedicated cores |
 | `bench_mpsc` | MPSC vs mutex throughput, ping-pong latency | Committed (container + WSL2/laptop, both pinned) |
 | `bench_batch` | Batch push vs single push, K=1..128 | Committed (container + WSL2/laptop, both pinned) |
 | `bench_t2t` | ITCH decode -> LOB -> A-S quote, single-threaded | Committed (container + WSL2/laptop, both pinned) |
@@ -167,8 +185,9 @@ were produced.
 |---|---|
 | Producer threads | Any number (M) |
 | Consumer threads | Exactly one |
-| Push complexity | Wait-free, O(1) |
-| Pop complexity | Lock-free, O(1) |
+| Push | Wait-free, O(1) (x86, ARM LSE); lock-free on ARMv8.0 LL/SC |
+| Pop | O(1), never blocks; algorithm is **not** lock-free (see Progress) |
+| Linearizable | **No** — per-producer FIFO, no loss/duplication, eventual visibility |
 | Memory allocation | None (intrusive) |
 | ABA problem | Impossible (no CAS) |
 | Per-producer ordering | FIFO guaranteed |
@@ -202,16 +221,16 @@ cmake --build build_asan && ctest --test-dir build_asan --output-on-failure
 
 **Intrusive nodes.** Nodes must inherit `MpscNode`. For a non-intrusive version, embed a `MpscNode` as a member of a wrapper and use a free-list allocator to amortise allocation cost.
 
-**Incomplete push window.** `pop()` may return `nullptr` when a producer has completed `tail_.exchange` but not yet stored to `prev->next`. Callers must retry on `nullptr`. This is inherent to the algorithm and cannot be eliminated without adding a separate counter (at the cost of two extra atomics per operation). Don't busy-spin unconditionally on this — see the recommended retry pattern below.
+**Incomplete push window.** `pop()` may return `nullptr` when a producer has completed `tail_.exchange` but not yet stored to `prev->next`. Callers must retry on `nullptr`. This is inherent to the algorithm, and it is also why the queue is not lock-free: if that producer is preempted, the window lasts until it runs again. Don't busy-spin unconditionally on this — see the recommended retry pattern below.
 
-**Node lifetime after `pop()`.** A node returned by `pop()` becomes the queue's new internal sentinel (`head_`) and stays part of the queue's bookkeeping until the *following* `pop()` call. Recycling that node back into circulation (e.g. handing it to a producer to re-push) before calling `pop()` again races the producer's reset of `node->next` against the consumer's next traversal and can corrupt the list. This bit `bench/bench_stress.cpp` during development — see `BENCHMARK_RESULTS.md`'s "Validation" section for how it manifested (a livelock, not a crash) and the fix (defer freeing a node by one `pop()`). Full detail and the fix pattern are in `queue.hpp`'s `pop()` doc comment.
+**Node lifetime after `pop()`.** A node returned by `pop()` becomes the queue's new sentinel (`head_`), and if the queue is now empty, also `tail_`. It stays in use until a *later* `pop()` returns a different node. A `pop()` that returns `nullptr` does **not** release it. An earlier version of this README said it did. Following that rule (pop `a`, pop `nullptr`, re-push `a`) links `a` to itself, and `pop()` then returns `a` forever, as `tests/test_lifetime.cpp` demonstrates. A drained queue therefore holds on to its last node until the next node arrives. This bit `bench/bench_stress.cpp` during development — see `BENCHMARK_RESULTS.md`'s "Validation" section for how it manifested (a livelock, not a crash) and the fix (release node k only once `pop()` has returned node k+1). Full detail and the fix pattern are in `queue.hpp`'s `pop()` doc comment.
 
 **Recommended retry pattern.** A bare `while (!(p = q.pop()));` is correct but burns a full core even when idle, and can starve producers on an oversubscribed host. Escalate: spin briefly, then yield, then sleep:
 
 ```cpp
 T* p; int spins = 0;
 while ((p = q.pop()) == nullptr) {
-    if      (spins < 1000) { __builtin_ia32_pause(); ++spins; }
+    if      (spins < 1000) { mpsc::cpu_relax(); ++spins; }   // PAUSE on x86, YIELD on ARM
     else if (spins < 1100) { std::this_thread::yield(); ++spins; }
     else                     std::this_thread::sleep_for(20us);
 }

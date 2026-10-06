@@ -37,6 +37,7 @@
 
 #include "histogram.hpp"
 #include "mpsc/queue.hpp"
+#include "mpsc/cpu_relax.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -101,7 +102,7 @@ struct SpinlockBackend {
     std::atomic_flag flag = ATOMIC_FLAG_INIT;
     std::queue<Node*> q;
 
-    void lock() { while (flag.test_and_set(std::memory_order_acquire)) __builtin_ia32_pause(); }
+    void lock() { while (flag.test_and_set(std::memory_order_acquire)) mpsc::cpu_relax(); }
     void unlock() { flag.clear(std::memory_order_release); }
 
     void push(Node* n) { lock(); q.push(n); unlock(); }
@@ -123,7 +124,7 @@ struct BoostLockfreeBackend {
     boost::lockfree::queue<Node*> q{1 << 16};
 
     void push(Node* n) {
-        while (!q.push(n)) __builtin_ia32_pause();   // capacity-bounded: retry on full
+        while (!q.push(n)) mpsc::cpu_relax();   // capacity-bounded: retry on full
     }
     Node* pop() {
         Node* n = nullptr;
@@ -164,7 +165,7 @@ RunResult run_sustained(Backend& backend, unsigned n_producers,
     for (unsigned p = 0; p < n_producers; ++p) {
         producers.emplace_back([&, p] {
             Node* ring = rings[p].get();
-            while (!start.load(std::memory_order_acquire)) __builtin_ia32_pause();
+            while (!start.load(std::memory_order_acquire)) mpsc::cpu_relax();
 
             uint64_t pushed = 0;
             std::size_t slot = 0;
@@ -190,7 +191,7 @@ RunResult run_sustained(Backend& backend, unsigned n_producers,
     }
 
     std::thread timer([&] {
-        while (!start.load(std::memory_order_acquire)) __builtin_ia32_pause();
+        while (!start.load(std::memory_order_acquire)) mpsc::cpu_relax();
         std::this_thread::sleep_for(duration);
         stop.store(true, std::memory_order_release);
     });

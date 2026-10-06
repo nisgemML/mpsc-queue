@@ -27,6 +27,7 @@
 // acquire/release is sufficient and no seq_cst is needed.
 
 #include "mpsc/queue.hpp"
+#include "mpsc/cpu_relax.hpp"
 #include <cstdio>
 #include <thread>
 #include <memory>
@@ -70,7 +71,7 @@ static void test_mp_litmus() {
     bool payload_ok = true;
     while (consumed < N) {
         PayloadNode* p = q.pop();
-        if (!p) { __builtin_ia32_pause(); continue; }
+        if (!p) { mpsc::cpu_relax(); continue; }
         if (p->payload != 0xDEADBEEFDEADBEEFULL) payload_ok = false;
         ++consumed;
     }
@@ -111,7 +112,7 @@ static void test_two_producers_order() {
 
     while (consumed < 2 * N) {
         SeqNode* p = q.pop();
-        if (!p) { __builtin_ia32_pause(); continue; }
+        if (!p) { mpsc::cpu_relax(); continue; }
         const int pid = p->producer_id;
         if (pid < 0 || pid > 1) { order_ok = false; }
         else {
@@ -166,7 +167,7 @@ static void test_many_producers() {
 
     while (consumed < N_TOTAL) {
         CountNode* p = q.pop();
-        if (!p) { __builtin_ia32_pause(); continue; }
+        if (!p) { mpsc::cpu_relax(); continue; }
         const int t = p->thread_id;
         if (t < 0 || t >= N_THREADS) { order_ok = false; }
         else {
@@ -213,7 +214,7 @@ static void test_incomplete_push_window() {
     while (!push_started.load(std::memory_order_acquire)) {}
 
     WindowNode* p = nullptr;
-    while (!(p = q.pop())) __builtin_ia32_pause();
+    while (!(p = q.pop())) mpsc::cpu_relax();
 
     CHECK(p == &n,         "incomplete-push: correct node returned");
     CHECK(p->value == 999, "incomplete-push: payload visible after acquire-load");

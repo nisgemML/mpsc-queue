@@ -92,11 +92,20 @@ all fields of `*next`. ∎
   Any write sequenced-before the exchange (including P1: `node->next = nullptr`)
   is visible to any thread that acquires from `tail_`.
 
-- **Acquire side:** the load of the old `tail_` value is an acquire load.
-  The current producer sees all writes sequenced-before the *previous*
-  producer's `tail_.exchange`. In particular, the previous producer's
-  `prev->next.store(node, release)` (P3) is visible — so we correctly
-  chain onto the last enqueued node.
+- **Acquire side:** the load of the old `tail_` value is an acquire load,
+  so everything sequenced-before the *previous* producer's exchange
+  happens-before ours. The write that matters is that producer's P1,
+  `prev->next.store(nullptr)`. Our P3 then writes `prev->next = node`.
+  Because P1 happens-before our P3, write-write coherence
+  ([intro.races]) puts our store *after* P1 in `prev->next`'s
+  modification order. Without the acquire, the two stores to `prev->next`
+  would be unordered, P1's null could land last, and our node (and
+  everything linked after it) would be silently lost.
+
+  (An earlier version of this section said the acquire makes the previous
+  producer's P3 visible. It cannot: that P3 is sequenced *after* the
+  exchange we synchronize with, so acquire guarantees nothing about it —
+  and nothing here needs it.)
 
 **What `seq_cst` would add:**
 
@@ -114,11 +123,30 @@ That edge is established by the release/acquire on `prev->next` (Claim 1).
 | RMW (exchange) | `LOCK XCHG` | `LOCK XCHG` |
 
 The `tail_.exchange` is a `LOCK XCHG` regardless of ordering because x86
-requires `LOCK` for atomic RMW. Using `seq_cst` on the exchange adds nothing.
-Using `seq_cst` on stores would add `MFENCE` (~10–40 ns on modern x86).
+requires `LOCK` for atomic RMW, so `seq_cst` on the exchange adds nothing.
+GCC compiles a `seq_cst` store to `XCHG`, not `MOV + MFENCE`. Disassembled
+(g++ 13 -O2): an acq_rel `push()` is `MOV; XCHG; MOV` (one locked op), and
+the same function with every op `seq_cst` is `XCHG; XCHG; XCHG` (three).
 
-**Conclusion:** `acq_rel` on `tail_.exchange` is both necessary and sufficient.
-`seq_cst` would cost 10–40 ns per push with zero correctness benefit. ∎
+**Measured, not estimated** (`bench/bench_ordering.cpp`, same algorithm,
+only the orderings differ; single thread, uncontended, Xeon @ 2.1 GHz
+container, median of 9 runs, two separate invocations):
+
+| | push (ns) | pop (ns) |
+|---|---|---|
+| acq_rel | 8.74 / 8.81 | 1.85 / 1.87 |
+| all seq_cst | 20.92 / 20.47 | 1.91 / 1.86 |
+
+Two extra locked instructions cost ~12 ns per push, 2.3x the acq_rel push;
+pop is unchanged, as the identical load codegen predicts. Under contention
+the gap depends on core count and topology; `scripts/run_pinned_bench.sh`
+runs the 2- and 4-producer comparison, which needs real dedicated cores.
+
+**Conclusion:** `acq_rel` on `tail_.exchange` is necessary — its release
+half (in the previous producer) and acquire half (in ours) together form
+the synchronizes-with edge the coherence argument above relies on — and
+sufficient. `seq_cst` throughout would cost ~2.3x on the uncontended push
+path with no correctness benefit. ∎
 
 ---
 
@@ -185,13 +213,22 @@ push(B): prev_B = tail_.exchange(B, acq_rel)   → prev_B == A (from same thread
          prev_B->next.store(B, release)         → A->next = B
 ```
 
-The exchange in push(B) loads `A` as the old tail because push(A) stored
-`A` into `tail_` before push(B) executes (sequenced-before in a single thread).
-Therefore `A` precedes `B` in the linked list, and the consumer dequeues A
-before B.
+The trace above is the single-producer case. With other producers running,
+push(B)'s exchange need **not** return `A`: another producer's exchange can
+land between them, giving `A → X → B`. The real argument does not need
+`prev_B == A`:
 
-This argument extends to any sequence A₁, A₂, ..., Aₙ from a single producer
-by induction: Aᵢ₋₁->next == Aᵢ by the same reasoning. ∎
+1. Every exchange on `tail_` is an RMW, so all of them form one total
+   modification order of `tail_`, and each exchange returns the value
+   written by its immediate predecessor in that order.
+2. Each node is linked after exactly the node that preceded it in that
+   order (its `prev`), so **list order = `tail_`'s modification order.**
+3. push(A)'s exchange is sequenced-before push(B)'s in one thread, so by
+   write-write coherence A's exchange precedes B's in that order.
+
+Hence A precedes B in the list, with zero or more other producers' nodes
+between them, and the single consumer dequeues A before B. Induction over
+A₁…Aₙ gives per-producer FIFO. ∎
 
 **Note:** FIFO across producers is *not* guaranteed. Two producers racing
 may have their nodes interleaved in any order depending on the scheduling
@@ -293,20 +330,86 @@ required. ∎
 
 ---
 
+## Claim 7: Node lifetime — when a popped node may be reused
+
+**Statement:** after `pop()` returns node `a`, `a` may be reused (mutated,
+freed, re-pushed) only once a *later* `pop()` has returned a different node.
+
+**Proof:** after the pop, `head_ == a`, so the next pop reads `a->next`.
+If the queue is now empty, `tail_ == a` as well, so the next push writes
+`a->next` (its P3). Neither pointer moves off `a` until a pop *returns* the
+node after it — a pop that returns `nullptr` changes nothing. ∎
+
+**This repo used to document the wrong rule** ("after the next pop(), even
+if it returns nullptr"). `tests/test_lifetime.cpp` follows that rule — push
+`a`, pop `a`, pop `nullptr`, re-push `a` — and gets `a->next == a` (the
+re-push's P3 runs with `prev == a`), after which `pop()` returns `a`
+forever. The test keeps that case as a tripwire, checks the correct rule,
+and recycles a 64-node pool across 4 producers under the correct rule
+(200,000 values, each delivered exactly once, clean under TSan and ASan).
+
+---
+
+## Progress and linearizability
+
+These are the properties most often overstated for this queue, including
+by an earlier version of this repo.
+
+**push() is wait-free on x86 and on AArch64 with LSE.** It is straight-line
+code: P1, one exchange, P3. That bound holds only if the exchange is
+wait-free in hardware: `LOCK XCHG` and LSE `SWPAL` are; ARMv8.0's
+`LDAXR/STLXR` loop can in principle retry forever under contention, which
+makes push lock-free, not wait-free, on such cores.
+
+**The queue is not lock-free.** `pop()` never loops, but returning `nullptr`
+is not progress. Suppose producer P is preempted between its exchange (P2)
+and its link store (P3). Every node pushed after P's exchange is linked
+behind P's node, which is unreachable until P3 runs. The consumer cannot
+dequeue any of them, however many other pushes complete, until a
+suspended thread is scheduled. A lock-free algorithm guarantees some
+thread makes progress in a bounded number of steps regardless of others'
+scheduling; this one does not. Vyukov's own description says the same. In
+practice the window is two instructions wide, so a stall needs a
+preemption at exactly that point — rare, not impossible, and most likely
+on oversubscribed hosts.
+
+**The queue is not linearizable.** Same scenario: P exchanges and is
+preempted; Q then pushes and *returns*; the consumer's `pop()` returns
+`nullptr`. Q's push completed before the pop started, so any linearization
+must order Q's push first, and then a FIFO queue containing Q's node
+cannot be empty. What does hold:
+
+- per-producer FIFO (Claim 5);
+- no loss and no duplication;
+- eventual visibility: a completed push is visible to the consumer once
+  every push whose exchange preceded it has also completed.
+
+An empty `pop()` therefore means "nothing is currently reachable", not
+"the queue is empty". Callers must treat it as a retry hint, which is how
+every consumer in this repo uses it.
+
+---
+
 ## Summary
 
 | Claim | Statement | Proof mechanism |
 |---|---|---|
 | 1 | Producer writes visible after pop | P1 →_sb P3 →_sw C2, transitivity |
-| 2 | acq_rel sufficient, seq_cst unnecessary | Only directed hb edge needed; x86 cost table |
+| 2 | acq_rel necessary and sufficient; seq_cst unnecessary | Release/acquire edge between producers orders stores to `prev->next` (coherence); seq_cst measured at ~2.3x push cost |
 | 3 | Incomplete-push window safe | Consumer reads nullptr, retries; no data race |
 | 4 | No ABA problem | No CAS in the queue |
-| 5 | FIFO within a single producer | Each exchange sees previous exchange's result |
+| 5 | FIFO within a single producer | List order = `tail_` modification order; coherence |
 | 6 | Batch publish correct | B1/B2 →_sb B4 →_sw C2; atomic boundary; no new ABA |
+| 7 | Reuse a popped node only after a later pop returns another | head_/tail_ still point at it until then |
+| — | Progress | push wait-free (x86, ARM LSE); queue **not** lock-free; **not** linearizable |
 
 All six claims hold under the C++20 memory model (**[intro.races]**, **[atomics.order]**).
-The proof has been validated empirically with 18 TSan litmus tests (see
-`tests/test_tsan.cpp`) — zero data races reported.
+The claims are exercised by 18 TSan litmus tests (`tests/test_tsan.cpp`,
+zero reports) and run on both x86-64 and AArch64 in CI. Neither is a
+proof: TSan checks the C++ memory model on the interleavings that actually
+ran, and hardware testing only shows behaviour the hardware happened to
+produce. AArch64 matters because it is weakly ordered, so a missing
+acquire or release can cause real misbehaviour there that x86's TSO hides.
 
 ---
 

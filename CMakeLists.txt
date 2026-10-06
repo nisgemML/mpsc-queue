@@ -5,8 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -march=native -g -DNDEBUG")
+# -march=native tunes for the build machine; skipped when cross-compiling,
+# where "native" would mean the host, not the target.
+if(CMAKE_CROSSCOMPILING)
+    set(MPSC_ARCH_FLAGS "")
+else()
+    set(MPSC_ARCH_FLAGS "-march=native")
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 ${MPSC_ARCH_FLAGS} -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 ${MPSC_ARCH_FLAGS} -g -DNDEBUG")
 
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter)
 
@@ -48,17 +55,33 @@ add_executable(test_batch tests/test_batch.cpp)
 target_link_libraries(test_batch PRIVATE mpsc_iface)
 add_test(NAME BatchCorrectness COMMAND test_batch)
 
+add_executable(test_lifetime tests/test_lifetime.cpp)
+target_link_libraries(test_lifetime PRIVATE mpsc_iface)
+add_test(NAME NodeLifetime COMMAND test_lifetime)
+
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 # None of these are registered with ctest — they're manual, and several
 # take multiple seconds to minutes by design (sustained-load measurement).
 # See BENCHMARK_RESULTS.md for what each one measures and how to reproduce
 # results on dedicated hardware.
 
-add_executable(bench_mpsc bench/bench_mpsc.cpp)
-target_link_libraries(bench_mpsc PRIVATE mpsc_iface)
+# Portable (std::chrono timing): builds and runs on x86-64 and AArch64.
+add_executable(bench_ordering bench/bench_ordering.cpp)
+target_link_libraries(bench_ordering PRIVATE mpsc_iface)
 
 add_executable(bench_batch bench/bench_batch.cpp)
 target_link_libraries(bench_batch PRIVATE mpsc_iface)
+
+# The remaining benchmarks time with the x86 TSC (rdtsc/rdtscp) and are
+# x86-only. Tests are portable and run on both architectures in CI.
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
+    message(STATUS "Non-x86 target: building tests + bench_ordering only (TSC-based benchmarks are x86-only)")
+    return()
+endif()
+
+add_executable(bench_mpsc bench/bench_mpsc.cpp)
+target_link_libraries(bench_mpsc PRIVATE mpsc_iface)
+
 
 add_executable(bench_stress bench/bench_stress.cpp)
 target_link_libraries(bench_stress PRIVATE mpsc_iface)

@@ -35,6 +35,7 @@
 
 #include "histogram.hpp"
 #include "mpsc/queue.hpp"
+#include "mpsc/cpu_relax.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -85,7 +86,7 @@ RunResult run_sustained(unsigned n_producers, std::chrono::seconds duration,
     for (unsigned p = 0; p < n_producers; ++p) {
         producers.emplace_back([&, p] {
             Node* ring = rings[p].get();
-            while (!start.load(std::memory_order_acquire)) __builtin_ia32_pause();
+            while (!start.load(std::memory_order_acquire)) mpsc::cpu_relax();
 
             uint64_t pushed = 0;
             std::size_t slot = 0;
@@ -124,7 +125,7 @@ RunResult run_sustained(unsigned n_producers, std::chrono::seconds duration,
     std::atomic<int> producers_running{int(n_producers)};
 
     std::thread timer([&] {
-        while (!start.load(std::memory_order_acquire)) __builtin_ia32_pause();
+        while (!start.load(std::memory_order_acquire)) mpsc::cpu_relax();
         std::this_thread::sleep_for(duration);
         stop.store(true, std::memory_order_release);
     });

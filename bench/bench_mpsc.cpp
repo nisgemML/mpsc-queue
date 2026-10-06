@@ -29,6 +29,7 @@
 // which understates latency when the queue is backpressured.
 
 #include "mpsc/queue.hpp"
+#include "mpsc/cpu_relax.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -88,14 +89,14 @@ static void bench_mpsc_throughput(int n_producers, int n_per_producer) {
     for (int t = 0; t < n_producers; ++t) {
         threads.emplace_back([&, t] {
             producers_ready.fetch_add(1, std::memory_order_release);
-            while (!start.load(std::memory_order_acquire)) __builtin_ia32_pause();
+            while (!start.load(std::memory_order_acquire)) mpsc::cpu_relax();
             for (int i = 0; i < n_per_producer; ++i)
                 q.push(&nodes[t][i]);
         });
     }
 
     while (producers_ready.load(std::memory_order_acquire) < n_producers)
-        __builtin_ia32_pause();
+        mpsc::cpu_relax();
 
     const auto t0 = Clock::now();
     start.store(true, std::memory_order_release);
@@ -103,7 +104,7 @@ static void bench_mpsc_throughput(int n_producers, int n_per_producer) {
     int consumed = 0;
     while (consumed < N_TOTAL) {
         BenchNode* p = q.pop();
-        if (!p) { __builtin_ia32_pause(); continue; }
+        if (!p) { mpsc::cpu_relax(); continue; }
         ++consumed;
     }
     const auto t1 = Clock::now();
@@ -136,7 +137,7 @@ static void bench_mutex_throughput(int n_producers, int n_per_producer) {
     for (int t = 0; t < n_producers; ++t) {
         threads.emplace_back([&, t] {
             producers_ready.fetch_add(1, std::memory_order_release);
-            while (!start.load(std::memory_order_acquire)) __builtin_ia32_pause();
+            while (!start.load(std::memory_order_acquire)) mpsc::cpu_relax();
             for (int i = 0; i < n_per_producer; ++i) {
                 std::lock_guard<std::mutex> lk(mtx);
                 q.push({t * n_per_producer + i});
@@ -145,7 +146,7 @@ static void bench_mutex_throughput(int n_producers, int n_per_producer) {
     }
 
     while (producers_ready.load(std::memory_order_acquire) < n_producers)
-        __builtin_ia32_pause();
+        mpsc::cpu_relax();
 
     const auto t0 = Clock::now();
     start.store(true, std::memory_order_release);
@@ -155,7 +156,7 @@ static void bench_mutex_throughput(int n_producers, int n_per_producer) {
         std::unique_lock<std::mutex> lk(mtx);
         if (q.empty()) {
             lk.unlock();
-            __builtin_ia32_pause();  // release lock so producers can push
+            mpsc::cpu_relax();  // release lock so producers can push
             continue;
         }
         q.pop();
@@ -221,7 +222,7 @@ static void bench_latency() {
         for (int i = 0; i < WARMUP + N; ++i) {
             // Wait for consumer to be ready (ping_pong == 0).
             while (ping_pong.load(std::memory_order_acquire) != 0)
-                __builtin_ia32_pause();
+                mpsc::cpu_relax();
 
             nodes[i].next.store(nullptr, std::memory_order_relaxed);
             unsigned aux;
@@ -239,10 +240,10 @@ static void bench_latency() {
     while (consumed < WARMUP + N) {
         // Wait for producer to push (ping_pong == 1).
         while (ping_pong.load(std::memory_order_acquire) != 1)
-            __builtin_ia32_pause();
+            mpsc::cpu_relax();
 
         LatNode* p = nullptr;
-        while (!(p = q.pop())) __builtin_ia32_pause();
+        while (!(p = q.pop())) mpsc::cpu_relax();
 
         unsigned aux;
         const uint64_t pop_cycles = __rdtscp(&aux);    // timestamp after pop

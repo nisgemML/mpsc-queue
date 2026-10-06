@@ -543,6 +543,72 @@ is still pending a run via `scripts/run_pinned_bench.sh`.
 
 ---
 
+## acq_rel vs seq_cst — measured
+
+`bench/bench_ordering.cpp` runs the identical algorithm twice, changing only
+the memory orderings ("seq_cst" = every op `seq_cst`, the `std::atomic`
+default). Disassembled `push()` (g++ 13 -O2, x86-64):
+
+```
+acq_rel:  mov $0,(n)   ; xchg (tail_)  ; mov n,(prev)      1 locked op
+seq_cst:  xchg (n)     ; xchg (tail_)  ; xchg (prev)       3 locked ops
+```
+
+Single thread, uncontended, Xeon @ 2.1 GHz container (tier-2, one vCPU),
+median of 9 interleaved runs, two separate invocations:
+
+```
+            push ns       pop ns
+acq_rel     8.74 / 8.81   1.85 / 1.87
+seq_cst    20.92 / 20.47  1.91 / 1.86
+per-run push, acq_rel: 8.57 - 10.11     per-run push, seq_cst: 20.11 - 24.45
+```
+
+Two extra locked instructions: about +12 ns per push (2.3x). Pop is
+unchanged, as identical load codegen predicts. An earlier README asserted
+"seq_cst adds MFENCE, ~10-40 ns per push" without measuring. The mechanism
+was wrong (GCC emits `XCHG`, not `MFENCE`), and the exchange itself costs the
+same either way.
+
+**Not yet recorded:** contended throughput (`bench_ordering mp 2|4`). It
+needs at least P+1 dedicated cores. On this one-vCPU container, "producers"
+only take turns on the same core, so its output here is a smoke test and is
+not published. `scripts/run_pinned_bench.sh` includes it.
+
+---
+
+## AArch64
+
+CI runs the full test suite (Release, TSan, ASan) on a GitHub `ubuntu-24.04-arm`
+runner as well as x86-64. The reason is the memory model, not portability.
+x86 is TSO, where the only reordering is a later load passing an earlier
+store, so most missing-acquire/release bugs cannot appear. AArch64 is weakly
+ordered, and the orderings compile to different instructions there
+(g++ 13 -O2, `push()`):
+
+```
+-march=armv8-a (no LSE):  str xzr ; ldaxr/stlxr + cbnz retry loop ; stlr
+-march=armv8.1-a (LSE):   str xzr ; swpal                         ; stlr
+```
+
+The no-LSE retry loop is why the docs say push is wait-free only where the
+hardware exchange is (x86, ARM LSE) and only lock-free on ARMv8.0. The CI
+job logs whether the runner's CPU has LSE.
+
+Locally, the whole suite was cross-compiled for AArch64 and run under
+`qemu-aarch64`: 20,218 + 32,033 + 12 + 18 checks, 0 failures. That shows the
+ARM build is functionally correct. It does **not** exercise weak memory
+ordering, because QEMU's user-mode emulation runs on an x86 host and
+inherits its stronger ordering, and its timings are meaningless. The real
+ARM runner provides the weak-memory evidence.
+
+Portability work this required: x86-only `__builtin_ia32_pause()` in the
+tests and backoff helper became `mpsc::cpu_relax()` (`PAUSE` on x86, `YIELD`
+on ARM). The `rdtsc`-timed benchmarks remain x86-only and are gated in
+CMake. Tests and `bench_ordering`/`bench_batch` build everywhere.
+
+---
+
 ## Validation (run in this repository, reproducible anywhere)
 
 Unlike the throughput/latency numbers above, these are pass/fail checks,
@@ -552,7 +618,7 @@ environment, and were run and verified as part of this pass:
 ```
 $ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
 $ ctest --test-dir build --output-on-failure
-100% tests passed, 0 tests failed out of 3   (Correctness, TSanLitmus, BatchCorrectness)
+100% tests passed, 0 tests failed out of 4   (Correctness, TSanLitmus, BatchCorrectness, NodeLifetime)
 
 $ g++ -std=c++20 -fsanitize=thread -g -O1 -I include bench/bench_stress.cpp -o bench_stress_tsan -lpthread
 $ ./bench_stress_tsan 1          # 1s per producer count, 1/2/4/8 producers
@@ -573,12 +639,17 @@ A real bug was caught during this validation pass, worth recording because
 it's exactly the kind of mistake this queue's design makes easy to make:
 `bench_stress.cpp`'s original draft recycled a popped node back to its
 producer immediately, but a popped node remains the queue's internal
-sentinel (`head_`) until the *following* `pop()` call - recycling it early
-raced the producer's node-reset against the consumer's next traversal and
-corrupted the list under sustained load (observed as a livelock, not a
+sentinel (`head_`, and `tail_` too when the queue is empty) until a *later*
+`pop()` returns a different node - recycling it early raced the producer's
+node-reset against the consumer's next traversal and corrupted the list
+under sustained load (observed as a livelock, not a
 crash, which made it initially look like a scheduler problem rather than a
-logic bug). Fixed by deferring the free-for-reuse signal by one `pop()`.
-This exact hazard is now documented in `queue.hpp`'s `pop()` doc comment,
+logic bug). Fixed by releasing node k only once `pop()` has returned node k+1.
+The documentation initially got the rule slightly wrong ("after the next
+`pop()`, even one returning `nullptr`"). `tests/test_lifetime.cpp` shows
+that following it creates a self-linked node that `pop()` returns forever
+(a livelock with the same shape as the one observed here). The corrected
+rule is in `queue.hpp`'s `pop()` doc comment and Claim 7 of the proof,
 since it isn't obvious from the API surface and will bite anyone building a
 recycling node pool on top of this queue the same way it bit this
 benchmark.

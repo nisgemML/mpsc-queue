@@ -6,11 +6,24 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //
 // This is the Dmitry Vyukov intrusive MPSC queue (2010), adapted to C++20
-// atomics.  It is:
-//   • Wait-free for producers (push always completes in a bounded number of steps)
-//   • Lock-free for the consumer (pop may retry but never blocks)
-//   • Linearisable: there exists a sequential history consistent with all
-//     concurrent executions
+// atomics.  Its progress and consistency guarantees, stated precisely
+// (proof/memory_model.md, "Progress and linearizability"):
+//
+//   • push(): wait-free — one atomic exchange and two stores, no loops —
+//     PROVIDED the hardware exchange is itself wait-free: x86 LOCK XCHG
+//     and AArch64 LSE SWPAL are; on ARMv8.0 without LSE the exchange is an
+//     LDAXR/STLXR retry loop, so push is only lock-free there.
+//   • pop(): never loops and never blocks — it returns nullptr instead.
+//     But the ALGORITHM is not lock-free. A producer preempted between
+//     its tail_ exchange and its link store hides every node pushed after
+//     it from the consumer until that producer runs again, so overall
+//     progress can depend on one suspended thread. This is inherent to
+//     Vyukov's design (his own write-up says so); the window is two
+//     instructions wide, which makes it rare, not impossible.
+//   • NOT linearizable, for the same reason: pop() can report "empty"
+//     after a push that STARTED later has already COMPLETED. What does
+//     hold: per-producer FIFO, and every completed push becomes visible
+//     once all pushes that started before it have completed.
 //
 // It is NOT:
 //   • Safe for multiple consumers (MPSC, not MPMC)
@@ -34,8 +47,8 @@
 // queue is non-empty.  The consumer handles this by returning nullptr and
 // retrying — see the recommended retry pattern in pop()'s doc comment
 // below. Node lifetime after a successful pop() has its own subtlety
-// (a popped node is still part of the queue's internal bookkeeping until
-// the *following* pop() call) — also documented on pop() below.
+// (a popped node remains the queue's sentinel until a LATER pop() returns
+// another node) — documented on pop() below.
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // MEMORY ORDERING PROOF
@@ -79,16 +92,21 @@
 //     we see all writes that the previous producer made before its own
 //     tail_.exchange.
 //
-// This is the standard "Harris list" / "Michael-Scott queue" approach.
-// Notably, acq_rel on the exchange is NOT seq_cst.  seq_cst would add a
-// full memory barrier (MFENCE on x86) that is unnecessary here because we
-// do not need to synchronise with any other shared variable beyond `next`
-// and `tail_`.
+// The acquire side is not optional. It makes the previous producer's
+// `node->next = nullptr` (its W1) happen-before OUR `prev->next = node`
+// (W2), so by write-write coherence our link is later in prev->next's
+// modification order and cannot be overwritten by that null — which would
+// silently drop our node and everything after it.
+//
+// acq_rel vs seq_cst on the exchange makes no difference on x86: both
+// compile to the same LOCK XCHG (checked with g++ 13 -O2). The ordering
+// choice only changes code for the plain stores (below).
 //
 // ── On x86-TSO ────────────────────────────────────────────────────────────
 //
-// x86 provides Total Store Order: all stores are globally ordered, and all
-// loads are ordered with respect to all prior stores from the same thread.
+// x86 provides Total Store Order: stores become visible in one global
+// order, and the ONLY reordering a thread can observe is a later load
+// passing an earlier store to a different address (via the store buffer).
 // Under TSO:
 //   • release stores compile to plain MOV (the TSO guarantee subsumes the
 //     release fence)
@@ -101,8 +119,15 @@
 // relaxed for plain loads and stores.  The only cost vs relaxed is the
 // LOCK prefix on exchange, which we need regardless for atomicity.
 //
-// seq_cst would add a gratuitous MFENCE on every store, costing ~10-40 ns.
-// For an MPSC queue on a hot path, that is unacceptable.
+// seq_cst STORES compile to XCHG (GCC emits XCHG, not MOV+MFENCE);
+// seq_cst loads stay plain MOV. Writing push() with every op seq_cst —
+// the std::atomic default — gives three locked XCHGs instead of one.
+// Measured cost: bench/bench_ordering.cpp, BENCHMARK_RESULTS.md.
+//
+// On AArch64 the orderings matter at the instruction level: release
+// store = STLR, acquire load = LDAR, relaxed = plain STR/LDR. CI runs the
+// suite on an ARM runner for that reason — x86 TSO hides most ordering
+// mistakes.
 //
 // ── Why NOT seq_cst ───────────────────────────────────────────────────────
 //
@@ -276,23 +301,27 @@ public:
     //
     // The node returned by pop() does not simply become "owned by the
     // caller" the way a value popped off std::queue would. Internally it
-    // becomes the new sentinel: head_ now points at it, and the *next*
-    // call to pop() will read THIS node's `next` field to find whatever
-    // comes after it. Concretely: after `T* a = q.pop();` succeeds, `a` is
-    // still part of the queue's internal bookkeeping until the following
-    // pop() call completes (whether that call returns another node or
-    // nullptr).
+    // becomes the new sentinel: head_ now points at it, and the next pop()
+    // reads THIS node's `next` field. If the queue is now empty, tail_
+    // also points at it, so the next push() will write its `next` field.
     //
-    // Practical consequence: do not recycle, mutate, or re-push a popped
-    // node until you have called pop() again at least once more. A pool
-    // that hands a just-popped node straight back to a producer — which
-    // will overwrite that node's `next` field as step 1 of push() — races
-    // with the queue's own traversal of that same field and can corrupt
-    // the list (this is not hypothetical: an earlier draft of this repo's
-    // own stress benchmark hit exactly this bug — see bench/bench_stress.cpp
-    // for the fix, which defers freeing a node by one pop). If you need a
-    // fixed-size node pool fed back to producers, free a node only once
-    // you're holding the NEXT one, not the one just returned.
+    // The rule: a popped node `a` belongs to the queue until a LATER pop()
+    // returns a DIFFERENT node. A pop() that returns nullptr does NOT
+    // release `a` — head_ and possibly tail_ still point at it. (An
+    // earlier version of this comment said "until the next pop(), whether
+    // it returns a node or nullptr". That rule is wrong:
+    // tests/test_lifetime.cpp follows it — push a, pop a, pop nullptr,
+    // re-push a — and gets a->next == a, after which pop() returns `a`
+    // forever.)
+    //
+    // Consequences:
+    //   • Pools: free node k only once pop() has returned node k+1. This
+    //     is what bench/bench_stress.cpp does (an earlier draft of it hit
+    //     the recycle-too-early race in practice).
+    //   • A drained queue keeps its last node indefinitely. Vyukov's
+    //     original re-pushes the stub to release it; this version trades
+    //     that for a simpler pop(). Stop all producers before freeing the
+    //     final node.
     //
     // Note: the old head_ (stub or previous consumed node) is NOT freed here.
     // The caller is responsible for managing the lifetime of popped nodes,
@@ -310,7 +339,7 @@ public:
     //
     //   T* p; int spins = 0;
     //   while ((p = q.pop()) == nullptr) {
-    //       if (spins < 1000)      { __builtin_ia32_pause(); ++spins; }
+    //       if (spins < 1000)      { mpsc::cpu_relax(); ++spins; }   // mpsc/cpu_relax.hpp
     //       else if (spins < 1100) { std::this_thread::yield(); ++spins; }
     //       else                    std::this_thread::sleep_for(20us);
     //   }
@@ -324,8 +353,8 @@ public:
 
         if (next == nullptr) return nullptr;       // (2) empty or incomplete push
 
-        // Handle the stub: if head_ is the stub and the stub has a successor,
-        // the first real node is `next`.  We make `next` the new head sentinel.
+        // `next` becomes the new head sentinel (see "Node lifetime" above);
+        // the stub is only ever the initial sentinel and is never returned.
         head_.store(next, std::memory_order_relaxed);              // (3)
         return static_cast<T*>(next);                              // (4)
     }
